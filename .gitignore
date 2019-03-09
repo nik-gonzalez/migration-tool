@@ -1,0 +1,22 @@
+# Eclipse
+.classpath
+.project
+.settings/
+
+# Intellij
+.idea/
+*.iml
+*.iws
+
+# Mac
+.DS_Store
+
+# Maven
+log/
+target/
+/src/main/resources/static/build/
+
+# generated folders
+/lucene/
+/uploads/
+/src/main/webapp/build
