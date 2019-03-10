@@ -6,6 +6,8 @@ import com.google.common.collect.Lists;
 import org.apache.commons.cli.*;
 import org.joda.time.DateTime;
 import org.joda.time.format.DateTimeFormat;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -17,6 +19,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -28,7 +31,11 @@ import static com.google.common.base.Predicates.not;
  *
  */
 public class App {
+
+    static final Logger LOG = LoggerFactory.getLogger(App.class);
+
     public static void main( String[] args ) throws IOException {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> LOG.info("caught shutdown signal.")));
         CommandLineParser parser = new DefaultParser();
         Options options = new Options();
         options.addRequiredOption("i", "input", true, "MS Sql File location");
@@ -69,15 +76,17 @@ public class App {
 
         }
         catch( ParseException exp ) {
-            System.out.println( "Unexpected exception:" + exp.getMessage() );
+            LOG.error("Unexpected exception:", exp);
         }
     }
 
     private static void generateFile(File in, File parentDir, List<String> booleanFields) throws IOException {
-        System.out.println(String.format("processing file %s", in.getName()));
+        LOG.info("processing file {}", in.getName());
         File out = new File(parentDir, String.format("%s.postgre.sql", in.getName()));
-        List<String> errors = new ArrayList<>();
         StringBuffer previous = new StringBuffer();
+        final AtomicInteger count = new AtomicInteger(0);
+        final AtomicInteger errorCount = new AtomicInteger(0);
+
         try (BufferedReader reader = Files.newBufferedReader(in.toPath(), Charset.forName("UTF-16")); BufferedWriter writer = Files.newBufferedWriter(out.toPath())) {
             reader.lines().forEach(s -> {
                 if (s.isEmpty() || s.startsWith("GO") || s.startsWith("USE") || s.startsWith("SET IDENTITY_INSERT")) {
@@ -85,7 +94,7 @@ public class App {
                 }
                 String toProcess = previous.append(s).toString();
                 try {
-                    writer.write(intToBoolean(booleanFields, replacAllHexWithDate(toProcess
+                    writer.write(intToBoolean(booleanFields, replaceAllHexWithDate(toProcess
                             .replaceAll("INSERT \\[", "INSERT INTO [")
                             .replaceAll("\\[dbo\\]\\.", "")
                             .replaceAll("\\[|\\]", "")
@@ -95,26 +104,18 @@ public class App {
                             + ";");
                     writer.newLine();
                     previous.delete(0, previous.length());
-                } catch (IllegalStateException e) {
+                    count.incrementAndGet();
+                } catch (MultiLineException e) {
+                    LOG.debug("{} detected multiline entry. line:\n\t {}", in.getName(), toProcess);
                     previous.append("\n");
                     return;
                 } catch (Exception e) {
-                    e.printStackTrace();
-                    System.err.println(String.format("error processing line:\n\t %s", toProcess));
-                    errors.add(String.format("error while processing line:\n\t %s", toProcess));
-                    try {
-                        writer.newLine();
-                        writer.write(toProcess);
-                    } catch (IOException e1) {
-                        e1.printStackTrace();
-                    }
+                    errorCount.incrementAndGet();
+                    LOG.error(String.format("[%s]error processing line:\n\t %s", in.getName(), toProcess), e);
                 }
             });
-            System.out.println(String.format("done processing file %s. saved to %s", in.getName(), out.getName()));
-        }
-        if (!errors.isEmpty()) {
-            errors.stream().forEach(System.out::println);
-            throw new IllegalStateException("unable to convert. see above errors.");
+            LOG.info("done processing file {}. processed {} rows with {} errors and saved to {}",
+                    in.getName(), count.get(), errorCount.get(), out.getName());
         }
     }
 
@@ -130,7 +131,7 @@ public class App {
         String[] fields = fieldPart.split(",");
         List<String> values = Splitter.onPattern(",(?=(?:[^\']*\'[^\']*\')*[^\']*$)").splitToList(valuePart);
         if (fields.length != values.size()) {
-            throw new IllegalStateException("values and fields do not match");
+            throw new MultiLineException("values and fields do not match");
         }
         List<String> valueOut = Lists.newArrayList();
         for (int i = 0; i < values.size(); i++) {
@@ -143,35 +144,36 @@ public class App {
         return in.substring(0, in.indexOf(") VALUES (")) + String.format(") VALUES %s)", Joiner.on(", ").join(valueOut));
     }
 
-    public static String readHexToDateString(String in) {
-        BigInteger dateInt = null;
-        BigInteger timeInt = null;
-        try {
-            String noPrefix = in.substring(2);
-            String datePart = noPrefix.substring(0, 8);
-            String timePart = noPrefix.substring(8);
-            dateInt = new BigInteger(datePart, 16);
-            timeInt = new BigInteger(timePart, 16);
-        } catch (Exception e) {
-            System.err.println(String.format("in: %s", in));
-            throw e;
-        }
+    private static String readHexToDateString(String in) {
+        BigInteger dateInt;
+        BigInteger timeInt;
+        String noPrefix = in.substring(2);
+        String datePart = noPrefix.substring(0, 8);
+        String timePart = noPrefix.substring(8);
+        dateInt = new BigInteger(datePart, 16);
+        timeInt = new BigInteger(timePart, 16);
         return DateTime.parse("1900-01-01", DateTimeFormat.forPattern("yyyy-MM-dd").withZoneUTC())
                 .plusDays(dateInt.intValue())
                 .plusMillis(timeInt.intValue()*10/3).toString("yyyy-MM-dd hh:mm:ssZ");
     }
 
-    public static String replacAllHexWithDate(String str) {
+    private static String replaceAllHexWithDate(String str) {
         Pattern p = Pattern.compile("(0x)([A-Z0-9]{16}[ ])", Pattern.CASE_INSENSITIVE);
         Matcher m = p.matcher(str);
         Map<String, String> matches = new HashMap<>();
         while(m.find()) {
-            matches.put(m.group().trim(), App.readHexToDateString(m.group().trim()));
+            matches.put(m.group().trim(), readHexToDateString(m.group().trim()));
         }
         String out = str;
         for (String key: matches.keySet()){
             out = out.replace(key, String.format("'%s'", matches.get(key)));
         }
         return out;
+    }
+
+    private static class MultiLineException extends RuntimeException {
+        public MultiLineException(String message) {
+            super(message);
+        }
     }
 }
