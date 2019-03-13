@@ -9,10 +9,7 @@ import org.joda.time.format.DateTimeFormat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
-import java.io.File;
-import java.io.IOException;
+import java.io.*;
 import java.math.BigInteger;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
@@ -35,7 +32,17 @@ public class App {
     static final Logger LOG = LoggerFactory.getLogger(App.class);
 
     public static void main( String[] args ) throws IOException {
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> LOG.info("caught shutdown signal.")));
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            LOG.info("exiting");
+            if (previous.length() > 0) {
+                File out = new File(".", "error.log");
+                try (BufferedWriter writer = new BufferedWriter(new FileWriter(out))) {
+                    writer.write(previous.toString());
+                } catch (IOException e) {
+                    LOG.error("error writing errors", e);
+                }
+            }
+        }));
         CommandLineParser parser = new DefaultParser();
         Options options = new Options();
         options.addRequiredOption("i", "input", true, "MS Sql File location");
@@ -80,54 +87,96 @@ public class App {
         }
     }
 
+    private static StringBuilder previous = new StringBuilder();
+
     private static void generateFile(File in, File parentDir, List<String> booleanFields) throws IOException {
         LOG.info("processing file {}", in.getName());
         File out = new File(parentDir, String.format("%s.postgre.sql", in.getName()));
-        StringBuffer previous = new StringBuffer();
         final AtomicInteger count = new AtomicInteger(0);
         final AtomicInteger errorCount = new AtomicInteger(0);
 
-        try (BufferedReader reader = Files.newBufferedReader(in.toPath(), Charset.forName("UTF-16")); BufferedWriter writer = Files.newBufferedWriter(out.toPath())) {
-            reader.lines().forEach(s -> {
-                if (s.isEmpty() || s.startsWith("GO") || s.startsWith("USE") || s.startsWith("SET IDENTITY_INSERT")) {
-                    return;
+
+//        try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(in), "UTF-16")); BufferedWriter writer = new BufferedWriter(new FileWriter(out)); BufferedWriter writerTooLong = new BufferedWriter(new FileWriter(outTooLong))) {
+        try (RandomAccessFile randomAccessFile = new RandomAccessFile(in, "r");BufferedWriter writer = new BufferedWriter(new FileWriter(out))) {
+            int bytesRead;
+            LOG.info("skipping 1st char {}", randomAccessFile.readChar());
+            do {
+                byte[] bytes = new byte[8192];
+                bytesRead = randomAccessFile.read(bytes);
+                String[] toProcess = new String(bytes, Charset.forName("UTF-16LE")).split("\n");
+                for (int i = 0; i < toProcess.length; i++) {
+                    migrateLine(in, booleanFields, previous, count, errorCount, writer, toProcess[i], i == toProcess.length -1);
                 }
-                String toProcess = previous.append(s).toString();
-                try {
-                    writer.write(intToBoolean(booleanFields, replaceAllHexWithDate(toProcess
-                            .replaceAll("INSERT \\[", "INSERT INTO [")
-                            .replaceAll("\\[dbo\\]\\.", "")
-                            .replaceAll("\\[|\\]", "")
-                            .replaceAll("N[']", "'")
-                            .replaceAll("N[']", "'")
-                            .replaceAll("DateTime", "TIMESTAMP")))
-                            + ";");
-                    writer.newLine();
-                    previous.delete(0, previous.length());
-                    count.incrementAndGet();
-                } catch (MultiLineException e) {
-                    LOG.debug("{} detected multiline entry. line:\n\t {}", in.getName(), toProcess);
-                    previous.append("\n");
-                    return;
-                } catch (Exception e) {
-                    errorCount.incrementAndGet();
-                    LOG.error(String.format("[%s]error processing line:\n\t %s", in.getName(), toProcess), e);
-                }
-            });
+            } while(bytesRead > -1);
+
             LOG.info("done processing file {}. processed {} rows with {} errors and saved to {}",
                     in.getName(), count.get(), errorCount.get(), out.getName());
         }
     }
 
+    private static void migrateLine(File in, List<String> booleanFields, StringBuilder previous, AtomicInteger count, AtomicInteger errorCount, BufferedWriter writer, String s, boolean last) {
+        LOG.debug("incoming string {}", s);
+//
+        if (s.isEmpty() || s.equals("GO") ||  s.startsWith("USE [") ||s.startsWith("SET IDENTITY_INSERT")) {
+            return;
+        }
+
+        if (previous.length() == 0) {
+            previous.append("\n");
+            LOG.info("appending incoming string {}", s);
+        }
+
+        String toProcess = previous.append(s
+                .replace("INSERT ", "INSERT INTO ")
+                .replaceAll("\\[dbo\\]\\.", "")
+                .replaceAll("\\[|\\]", "")
+                .replace("N'", "'")
+                .replace("AS Numeric(19, 0)", "AS Numeric(19)")
+                .replace("DateTime", "TIMESTAMP")
+        ).toString();
+
+        try {
+            writer.write(intToBoolean(booleanFields, replaceAllHexWithDate(toProcess))
+                    .replace("INSERT ", "INSERT INTO ")
+                    .replace("dbo.", "")
+                    .replaceAll("\\[|\\]", "")
+                    .replace("N'", "'")
+                    .replace("AS Numeric(19, 0)", "AS Numeric(19)")
+                    .replace("DateTime", "TIMESTAMP")+";");
+            writer.newLine();
+            count.incrementAndGet();
+            previous.delete(0, previous.length());
+        } catch (MultiLineException e) {
+            LOG.debug("{} detected multiline entry. line:\n\t {}", in.getName(), toProcess);
+            return;
+        } catch (Exception e) {
+            errorCount.incrementAndGet();
+            LOG.error(String.format("[%s]error processing line:\n\t %s", in.getName(), toProcess), e);
+            System.exit(9);
+        }
+    }
+
     private static String intToBoolean(List<String> booleanFields, String in) {
+        if (!in.contains(" VALUES ")) {
+            throw new MultiLineException("incomplete line");
+        }
         String numericHolder = "__n_u_m____e_r_ic_";
         String numeric = "Numeric(19, 0)";
         String decimalHolder = "__d_e_c____i_m_al_";
         String decimal = "Decimal(10, 2)";
         String noNumeric = in.replace(numeric, numericHolder).replace(decimal, decimalHolder);
-        String[] strings = noNumeric.split("[ ]VALUES[ ]");
-        String fieldPart = strings[0].substring(strings[0].indexOf("("), strings[0].indexOf(")"));
-        String valuePart = strings[1].substring(strings[1].indexOf("("), strings[1].lastIndexOf(")"));
+        String[] strings = noNumeric.split(" VALUES ");
+        if (strings.length != 2) {
+            throw new MultiLineException("not enough tokens");
+        }
+        String fieldPart = null;
+        String valuePart = null;
+        try {
+            fieldPart = strings[0].substring(strings[0].indexOf("("), strings[0].indexOf(")"));
+            valuePart = strings[1].substring(strings[1].indexOf("("), strings[1].lastIndexOf(")"));
+        } catch (Exception e) {
+            throw new MultiLineException("missing tokens");
+        }
         String[] fields = fieldPart.split(",");
         List<String> values = Splitter.onPattern(",(?=(?:[^\']*\'[^\']*\')*[^\']*$)").splitToList(valuePart);
         if (fields.length != values.size()) {

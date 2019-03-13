@@ -9,8 +9,6 @@
   <version>1.0-SNAPSHOT</version>
 
   <name>sqlserver-to-postgresql</name>
-  <!-- FIXME change it to the project's website -->
-  <url>http://www.example.com</url>
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -20,6 +18,7 @@
     <joda-time.version>2.10.1</joda-time.version>
     <guava.version>27.0.1-jre</guava.version>
     <logback.version>1.2.3</logback.version>
+    <shade-plugin.version>3.2.1</shade-plugin.version>
   </properties>
 
   <dependencies>
@@ -104,6 +103,26 @@
           <source>8</source>
           <target>8</target>
         </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>${shade-plugin.version}</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>com.sqlserver.to.postgresql.App</mainClass>
+                </transformer>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
     </plugins>
   </build>
